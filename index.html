@@ -7018,19 +7018,51 @@ function renderAppPackageAppendixSection(period){
   renderAppPackageAppendixChart();
 }
 
+// Fill Rate ("fr") and eCPM ("cpm") are DERIVED metrics -- the raw per-day
+// App Package Appendix row Python emits only ever carries
+// name/rev/imp/req/dau/playtimeMinutes (see export_dashboard_snapshot_
+// nowgg.py's app_package_appendix_rows builder); it never stores a
+// per-day "fr"/"cpm" field. The Appendix TABLE computes both via
+// ratio-of-sums AFTER aggregating rev/imp/req across the selected date
+// range (aggregateAppPackageAppendix(): fr = imp/req*100, cpm =
+// rev/imp*1000) -- a single day is exactly the one-day-range case of that
+// same ratio, so this reuses the IDENTICAL formula, applied per-day here
+// purely because a chart series needs one value per day. FIX (chart-layer
+// normalization, not a snapshot schema change): previously
+// appPackageDailySeriesFor() read `row.fr`/`row.cpm` directly, which are
+// always `undefined` on the raw per-day row -- every eCPM/Fill Rate data
+// point silently resolved to `null`, rendering a blank chart for those two
+// metrics across Daily/Weekly/Monthly. Every other metric (dau,
+// playtimeMinutes, req, imp, rev) IS stored directly on the row, so those
+// pass through unchanged below.
+function appPackageMetricValueFromRow(row, metric){
+  if(!row) return null;
+  if(metric==="fr"){
+    const req = row.req, imp = row.imp;
+    return (req!=null && imp!=null && req>0) ? imp/req*100 : null;
+  }
+  if(metric==="cpm"){
+    const rev = row.rev, imp = row.imp;
+    return (imp!=null && imp>0) ? rev/imp*1000 : null;
+  }
+  return row[metric]!=null ? row[metric] : null;
+}
+
 // Per-(app package, metric) daily value across a fixed date-index window,
 // read directly from APP_PACKAGE_APPENDIX_BY_DATE (real per-day allocated/
 // joined figures -- see export_dashboard_snapshot_nowgg.py's own
 // appPackageAppendix construction). A day this app package didn't appear
 // in the allocation for (or that lacks BQ DAU/Playtime coverage yet) is
 // `null`, never a fabricated 0 -- mirrors dailySecondarySeries()'s own
-// Playtime null-handling above.
+// Playtime null-handling above. Fill Rate/eCPM are derived per-day via
+// appPackageMetricValueFromRow() above; every other metric is read
+// straight off the row, unchanged.
 function appPackageDailySeriesFor(name, metric, startIdx, endIdx){
   const out = [];
   for(let i=startIdx;i<=endIdx;i++){
     const dayRows = APP_PACKAGE_APPENDIX_BY_DATE[SERIES.dates[i]];
     const row = dayRows && dayRows.find(r=> r.name===name);
-    out.push(row && row[metric]!=null ? row[metric] : null);
+    out.push(appPackageMetricValueFromRow(row, metric));
   }
   return out;
 }
