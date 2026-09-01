@@ -11543,10 +11543,89 @@ function resolveOverallPeriod(tab, clockSeries){
     curLabel:`Latest Complete Day (${fmtDateShort(clockSeries.dates[latestIdx])})` };
 }
 
-// Combines BlueStacks(selected geography) + now.gg for a given [s,e] range
-// -- plain addition of the two products' already-canonical per-day
-// figures, then the required sum-then-divide recompute for Fill Rate/eCPM
-// (never an average of the two products' own fill rates/eCPMs).
+// Cross-product date alignment (fix, added 2026-09-01 -- Overall tab
+// data-display regression): every function below that combines
+// BlueStacks' and now.gg's own per-day SERIES arrays used to read BOTH
+// products at the SAME raw array index, taken from whichever series is
+// currently Overall's "clock" (overallClockSeries(), documented elsewhere
+// in this file as an assumption that "both products publish the same
+// date range" -- true in steady state, but never guaranteed: a storage-
+// retention/backfill gap, a source outage, or simply one product's
+// history starting later than the other's can legitimately leave one
+// product's exported SERIES shorter, or offset, relative to the other's).
+// Once that happens, reading the SHORTER series at an index past its own
+// length returns `undefined` (plain JS array semantics) -- and
+// `undefined + <number>` is `NaN`, which then poisons every downstream
+// sum it touches (Revenue, DAU, Playtime, Ad Requests, Impressions, Fill
+// Rate, eCPM -- every one of Overall's KPIs and charts), typically for the
+// MOST RECENT dates (since a shorter product series is usually anchored
+// to today and missing only its OLDER history, exactly the tail end
+// Overall's Daily/Weekly views read). This is a genuine, previously-
+// undetected bug in Overall's own combination logic, not a data-
+// generation defect -- confirmed by this file's OWN aggregateOverallBidders()
+// just below, which already reads each product via a DATE-keyed lookup
+// (`dimsByDate[date]`) rather than a shared array index, and therefore
+// was never affected by this class of bug.
+//
+// `overallSeriesDateIndex()`/`aggregateSeriesRangeForDates()` fix this by
+// mirroring that same already-correct, already-established convention for
+// SERIES arrays too: every per-day value is read from EACH product's own
+// date->index mapping, never a position borrowed from a different
+// product's clock. A date a product's own series genuinely has no entry
+// for contributes nothing to that product's sum (skipped, never
+// fabricated) -- exactly this file's existing "never fabricate a missing
+// value" convention already used for a disabled product's ZERO
+// contribution and for dau/playtimeMinutes' own null-unless-fully-covered
+// rule. When both products' date ranges DO match exactly (the common,
+// intended case), this is byte-identical to the previous index-based
+// behavior -- every date resolves to the exact same index it already
+// would have.
+//
+// Deliberately a NEW pair of functions, not a change to the existing
+// aggregateSeriesRange(series,s,e) above -- that function is also used by
+// every real per-product tab's own single-series Daily/Weekly/Monthly
+// aggregation (never combining two different products' arrays), so it is
+// left completely untouched; only Overall's own cross-product combination
+// path is affected by this fix.
+function overallSeriesDateIndex(series){
+  const m = new Map();
+  series.dates.forEach((d,i)=>{ m.set(d, i); });
+  return m;
+}
+function aggregateSeriesRangeForDates(series, dates){
+  const idxOf = overallSeriesDateIndex(series);
+  let revSum=0, reqSum=0, impSum=0;
+  let dauSum=0, dauDays=0, playtimeSum=0, playtimeDays=0;
+  dates.forEach(date=>{
+    const i = idxOf.get(date);
+    if(i==null) return; // this product has no data for this date -- skip, never fabricate
+    const req = series.requestsM[i], fr = series.fillRate[i];
+    const imp = req*fr/100;
+    revSum += series.revenue[i];
+    reqSum += req;
+    impSum += imp;
+    if(series.dau && series.dau[i]!=null){ dauSum += series.dau[i]; dauDays += 1; }
+    if(series.playtimeMinutes && series.playtimeMinutes[i]!=null){ playtimeSum += series.playtimeMinutes[i]; playtimeDays += 1; }
+  });
+  const days = dates.length;
+  return {
+    revenue: revSum, requestsM: reqSum, impressionsM: impSum,
+    fillRate: reqSum ? impSum/reqSum*100 : null,
+    cpm: impSum ? revSum/(impSum*1000) : null,
+    dau: (days>0 && dauDays===days) ? dauSum : null,
+    playtimeMinutes: (days>0 && playtimeDays===days) ? playtimeSum : null,
+    days, startDate: dates[0], endDate: dates[dates.length-1],
+  };
+}
+
+// Combines BlueStacks(selected geography) + now.gg for a given [s,e]
+// CLOCK-index range (indices into overallClockSeries(), exactly as every
+// existing caller already resolves them via resolveOverallPeriod()) --
+// plain addition of the two products' already-canonical per-day figures,
+// then the required sum-then-divide recompute for Fill Rate/eCPM (never
+// an average of the two products' own fill rates/eCPMs). Each product's
+// own contribution is read via aggregateSeriesRangeForDates() above (by
+// DATE, not by raw index) -- see that function's own comment for why.
 //
 // GUARDED 2026-08-19 (Product Configuration & Refresh Architecture,
 // spec sections 4/6): a disabled product simply contributes zero to the
@@ -11566,8 +11645,14 @@ function aggregateOverallRange(s, e){
   // product's own dau/playtimeMinutes (real number or null), never
   // fabricating/forcing a value.
   const ZERO = {revenue:0, requestsM:0, impressionsM:0, dau:0, playtimeMinutes:0};
-  const bs = overallBsEnabled() ? aggregateSeriesRange(overallBsSeries(), s, e) : ZERO;
-  const ng = overallNgEnabled() ? aggregateSeriesRange(overallNgSeries(), s, e) : ZERO;
+  // `s`/`e` are indices into overallClockSeries() (see resolveOverallPeriod()) --
+  // resolved to actual calendar-date strings ONCE here, then each product
+  // looks itself up by date via aggregateSeriesRangeForDates() above,
+  // never by re-using these clock indices directly against a product's
+  // own (possibly differently-ranged) series.
+  const clockDates = overallClockSeries().dates.slice(s, e+1);
+  const bs = overallBsEnabled() ? aggregateSeriesRangeForDates(overallBsSeries(), clockDates) : ZERO;
+  const ng = overallNgEnabled() ? aggregateSeriesRangeForDates(overallNgSeries(), clockDates) : ZERO;
   const revenue = bs.revenue + ng.revenue;
   const requestsM = bs.requestsM + ng.requestsM;
   const impressionsM = bs.impressionsM + ng.impressionsM;
@@ -12108,13 +12193,31 @@ function renderOverallCharts(period, clockSeries){
   // shown under the plain "Now.gg" label -- whenever that mode is active.
   const bsSeries = overallBsSeries(), ngSeries = overallNgSeries(), ngLabel = overallNgLabel();
   const host = document.getElementById("overallChartsHost");
+  // Cross-product date alignment (fix, added 2026-09-01 -- see
+  // aggregateSeriesRangeForDates()'s own comment above for the full
+  // rationale): every `dates`/index window below is resolved from
+  // bsSeries/the clock, exactly as before, but each product's own point
+  // for a given date is now read via ITS OWN date->index map
+  // (bsIdx/ngIdx), never by re-using the clock's raw index directly
+  // against the OTHER product's array. A date a product's own series has
+  // no entry for renders as `null` for that one point (the existing
+  // chart-drawing helpers already treat `null` as a gap, exactly like
+  // every other "no data this day" case in this file), never an
+  // `undefined`/NaN value silently corrupting the whole line. When both
+  // products' date ranges match exactly (the common, intended case), this
+  // is byte-identical to the previous behavior.
+  const bsIdx = overallSeriesDateIndex(bsSeries), ngIdx = overallSeriesDateIndex(ngSeries);
+  function metricAt(m, series, idxOf, date){
+    const i = idxOf.get(date);
+    return i==null ? null : m.seriesFor(series, i);
+  }
 
   if(period.key==="daily"){
     const chartRange = overallDailyChartRange(clockSeries);
     const dates = bsSeries.dates.slice(chartRange.s, chartRange.e+1);
     host.innerHTML = OVERALL_CHART_METRICS.map(m=>{
-      const a = [], b = [];
-      for(let i=chartRange.s;i<=chartRange.e;i++){ a.push(m.seriesFor(bsSeries,i)); b.push(m.seriesFor(ngSeries,i)); }
+      const a = dates.map(d=> metricAt(m, bsSeries, bsIdx, d));
+      const b = dates.map(d=> metricAt(m, ngSeries, ngIdx, d));
       return `<div class="card" style="margin-bottom:16px;">
         <div class="card-title">${escapeHtml(m.title)}</div>
         <div class="card-sub">${escapeHtml(overallGeographyLabel())} vs ${escapeHtml(ngLabel)} · Last ${dates.length} Days</div>
@@ -12132,8 +12235,8 @@ function renderOverallCharts(period, clockSeries){
     // uses instead of plotting two undefined previous-period lines.
     const dates = bsSeries.dates.slice(period.range.s, period.range.e+1);
     host.innerHTML = OVERALL_CHART_METRICS.map(m=>{
-      const a = [], b = [];
-      for(let i=period.range.s;i<=period.range.e;i++){ a.push(m.seriesFor(bsSeries,i)); b.push(m.seriesFor(ngSeries,i)); }
+      const a = dates.map(d=> metricAt(m, bsSeries, bsIdx, d));
+      const b = dates.map(d=> metricAt(m, ngSeries, ngIdx, d));
       return `<div class="card" style="margin-bottom:16px;">
         <div class="card-title">${escapeHtml(m.title)}</div>
         <div class="card-sub">${escapeHtml(overallGeographyLabel())} vs ${escapeHtml(ngLabel)} · No prior-period comparison available yet</div>
@@ -12153,9 +12256,10 @@ function renderOverallCharts(period, clockSeries){
   const prevDates = bsSeries.dates.slice(period.cmpRange.s, period.cmpRange.e+1);
   const periodNoun = period.key==="weekly" ? "Week" : "Month";
   host.innerHTML = OVERALL_CHART_METRICS.map(m=>{
-    const bsCur=[], bsPrev=[], ngCur=[], ngPrev=[];
-    for(let i=period.range.s;i<=period.range.e;i++){ bsCur.push(m.seriesFor(bsSeries,i)); ngCur.push(m.seriesFor(ngSeries,i)); }
-    for(let i=period.cmpRange.s;i<=period.cmpRange.e;i++){ bsPrev.push(m.seriesFor(bsSeries,i)); ngPrev.push(m.seriesFor(ngSeries,i)); }
+    const bsCur = curDates.map(d=> metricAt(m, bsSeries, bsIdx, d));
+    const ngCur = curDates.map(d=> metricAt(m, ngSeries, ngIdx, d));
+    const bsPrev = prevDates.map(d=> metricAt(m, bsSeries, bsIdx, d));
+    const ngPrev = prevDates.map(d=> metricAt(m, ngSeries, ngIdx, d));
     return `<div class="card" style="margin-bottom:16px;">
       <div class="card-title">${escapeHtml(m.title)}</div>
       <div class="card-sub">${escapeHtml(overallGeographyLabel())} vs ${escapeHtml(ngLabel)} · Current ${periodNoun} vs Previous ${periodNoun}</div>
